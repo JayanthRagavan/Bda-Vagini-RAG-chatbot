@@ -1,0 +1,144 @@
+import streamlit as st
+from huggingface_hub import hf_hub_download
+from langchain.prompts import PromptTemplate
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.chains import RetrievalQA
+from langchain.vectorstores import Pinecone
+from langchain.llms.base import LLM
+from dotenv import load_dotenv
+import os
+import warnings
+import requests
+from typing import Optional, List
+warnings.filterwarnings("ignore")
+
+PINECONE_API_KEY = '5965fff2-b55f-4f7c-80ad-2dea835b8edd'
+GROQ_API_KEY = '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'
+
+#custom GroqLLM class
+class GroqLLM(LLM):
+    """
+    Custom LangChain LLM wrapper for Groq's API.
+    """
+    api_key: str
+    model: str
+    endpoint: str = "https://api.groq.com/openai/v1/chat/completions"  
+
+    @property
+    def _llm_type(self):
+        return "groq"
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "model": self.model,
+        }
+        response = requests.post(
+            self.endpoint,  
+            headers=headers,
+            json=payload
+        )
+        if response.status_code != 200:
+            print(f"Status Code: {response.status_code}")
+            print(f"Response Body: {response.text}")
+            raise ValueError(f"Groq API request failed: {response.text}")
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+
+GROQ_MODEL = "llama3-8b-8192"  
+llm = GroqLLM(
+    api_key=GROQ_API_KEY,
+    model=GROQ_MODEL
+)
+
+#prompt template
+prompt_template = """
+Use the following pieces of information to answer the user's question.
+If you don't know the answer, just say that you don't know, don't try to make up an answer.
+
+Context : {context}
+Question : {question}
+
+Only return the helpful answer below and nothing else.
+Helpful answer :
+"""
+
+prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
+chain_type_kwargs = {"prompt": prompt}
+
+embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+index_name = "chatbot"
+docsearch = Pinecone.from_existing_index(
+    index_name=index_name,
+    embedding=embeddings,
+    namespace="_medical_"
+)
+
+#RetrievalQA chain with Groq LLM
+qa = RetrievalQA.from_chain_type(
+    llm=llm,
+    chain_type="stuff",
+    retriever=docsearch.as_retriever(search_kwargs={'k': 2}),
+    return_source_documents=True,
+    chain_type_kwargs=chain_type_kwargs
+)
+
+# Streamlit UI
+st.set_page_config(page_title="RAG Chatbot", layout="wide")
+
+st.title("🩺 Vahini: Medical RAG Chatbot")
+if "messages" not in st.session_state:
+    st.session_state["messages"] = []
+
+with st.sidebar:
+    st.header("Instructions")
+    st.write(
+        """
+        Welcome to Vahini: the Medical RAG Chatbot! This chatbot can help answer your medical-related questions using retrieval-augmented generation.
+        
+        **How to Use:**
+        - Type your question in the input box below.
+        - Press "Send" to receive an answer.
+        - Type "exit" to end the session.
+        """
+    )
+
+for msg in st.session_state["messages"]:
+    if msg["role"] == "user":
+        st.markdown(f"**You:** {msg['content']}")
+    else:
+        st.markdown(f"**Vahini:** {msg['content']}")
+
+user_input = st.text_input("You:", key="input")
+
+if st.button("Send"):
+    if user_input.strip() == "":
+        st.warning("Please enter a message.")
+    elif user_input.strip().lower() == "exit":
+        st.session_state["messages"].append({"role": "Vahini", "content": "Goodbye! Stay safe."})
+        st.experimental_rerun()
+    else:
+        st.session_state["messages"].append({"role": "user", "content": user_input})
+        st.markdown(f"**You:** {user_input}")
+        
+        try:
+            result = qa({"query": user_input})
+            response = result["result"]
+            
+            st.session_state["messages"].append({"role": "Vahini", "content": response})
+            
+            st.markdown(f"**Vahini:** {response}")
+            
+        except Exception as e:
+            error_message = f"An error occurred: {e}"
+            st.session_state["messages"].append({"role": "Vahini", "content": error_message})
+            st.markdown(f"**Vahini:** {error_message}")
+
+
